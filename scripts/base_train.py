@@ -25,7 +25,8 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT as BaseGPT, GPTConfig as BaseGPTConfig, Linear
+from nanochat.loopedgpt import GPT as LoopedGPT, GPTConfig as LoopedGPTConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -52,6 +53,8 @@ parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = de
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--model-impl", type=str, default="gpt", choices=["gpt", "looped"], help="model implementation to train")
+parser.add_argument("--num-loops", type=int, default=2, help="number of loop iterations for looped model")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -75,6 +78,7 @@ parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluat
 parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
 parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
 parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
+parser.add_argument("--progress-every", type=int, default=10, help="print a compact progress line every N steps (-1 = disable)")
 # Output
 parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
 args = parser.parse_args()
@@ -133,13 +137,30 @@ def build_model_meta(depth):
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
-    config = GPTConfig(
-        sequence_len=args.max_seq_len, vocab_size=vocab_size,
-        n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
+    if args.model_impl == "looped":
+        config_cls = LoopedGPTConfig
+        model_cls = LoopedGPT
+    else:
+        config_cls = BaseGPTConfig
+        model_cls = BaseGPT
+    config_kwargs = dict(
+        sequence_len=args.max_seq_len,
+        vocab_size=vocab_size,
+        n_layer=depth,
+        n_head=num_heads,
+        n_kv_head=num_heads,
+        n_embd=model_dim,
         window_pattern=args.window_pattern,
     )
+    if args.model_impl == "looped":
+        config_kwargs.update(
+            num_loops=args.num_loops,
+            entropy_beta=0.01,
+            exit_threshold=0.5,
+        )
+    config = config_cls(**config_kwargs)
     with torch.device("meta"):
-        model_meta = GPT(config)
+        model_meta = model_cls(config)
     return model_meta
 
 # Build the model, move to device, init the weights
@@ -152,7 +173,7 @@ model.init_weights() # 3) All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
+output_dirname = args.model_tag if args.model_tag else (f"d{args.depth}" if args.model_impl == "gpt" else f"loopd{args.depth}x{args.num_loops}")
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
 resuming = args.resume_from_step != -1
 if resuming:
@@ -412,6 +433,20 @@ print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_l
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
+
+def print_progress_line(step, num_iterations, debiased_smooth_loss, lrm, dt, tok_per_sec, mfu, epoch, total_training_time, eta_str, final=False):
+    if not master_process:
+        return
+    pct_done = 100 * step / num_iterations
+    msg = (
+        f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | "
+        f"loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | "
+        f"dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | "
+        f"bf16_mfu: {mfu:.2f} | epoch: {epoch} | "
+        f"total time: {total_training_time/60:.2f}m{eta_str}"
+    )
+    print0(msg)
+
 # Go!
 while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
@@ -484,6 +519,7 @@ while True:
                 "step": step,
                 "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
+                "model_impl": args.model_impl,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
@@ -564,7 +600,8 @@ while True:
     else:
         eta_str = ""
     epoch = f"{dataloader_state_dict['epoch']} pq: {dataloader_state_dict['pq_idx']} rg: {dataloader_state_dict['rg_idx']}"
-    print0(f"step {step:05d}/{num_iterations:05d} ({pct_done:.2f}%) | loss: {debiased_smooth_loss:.6f} | lrm: {lrm:.2f} | dt: {dt * 1000:.2f}ms | tok/sec: {tok_per_sec:,} | bf16_mfu: {mfu:.2f} | epoch: {epoch} | total time: {total_training_time/60:.2f}m{eta_str}")
+    if args.progress_every > 0 and (last_step or step % args.progress_every == 0):
+        print_progress_line(step, num_iterations, debiased_smooth_loss, lrm, dt, tok_per_sec, mfu, epoch, total_training_time, eta_str, final=last_step)
     if step % 100 == 0:
         log_data = {
             "step": step,

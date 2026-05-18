@@ -136,6 +136,74 @@ class KVCache:
         if other.prev_embedding is not None:
             self.prev_embedding = other.prev_embedding.expand(self.batch_size, -1, -1).clone()
 
+
+class LoopedKVCache:
+    """
+    Wrapper around one KVCache per loop.
+
+    Each loop maintains its own KV state so the looped model can reuse the same
+    transformer block stack multiple times without clobbering cache contents from
+    other loops.
+    """
+
+    def __init__(self, batch_size, num_heads, seq_len, head_dim, num_layers, num_loops, device, dtype):
+        self.batch_size = batch_size
+        self.max_seq_len = seq_len
+        self.n_layers = num_layers
+        self.n_heads = num_heads
+        self.head_dim = head_dim
+        self.num_loops = num_loops
+        self.loop_caches = [
+            KVCache(
+                batch_size=batch_size,
+                num_heads=num_heads,
+                seq_len=seq_len,
+                head_dim=head_dim,
+                num_layers=num_layers,
+                device=device,
+                dtype=dtype,
+            )
+            for _ in range(num_loops)
+        ]
+
+    def reset(self):
+        for cache in self.loop_caches:
+            cache.reset()
+
+    def get_loop_cache(self, loop_idx):
+        return self.loop_caches[loop_idx]
+
+    def get_cache_seqlens(self, loop_idx=0):
+        return self.loop_caches[loop_idx].cache_seqlens
+
+    def get_pos(self, loop_idx=0):
+        return self.loop_caches[loop_idx].get_pos()
+
+    def get_layer_cache(self, layer_idx, loop_idx=0):
+        return self.loop_caches[loop_idx].get_layer_cache(layer_idx)
+
+    def advance(self, num_tokens, loop_idx=0):
+        self.loop_caches[loop_idx].advance(num_tokens)
+
+    @property
+    def prev_embedding(self):
+        return self.loop_caches[0].prev_embedding
+
+    @prev_embedding.setter
+    def prev_embedding(self, value):
+        for cache in self.loop_caches:
+            cache.prev_embedding = value
+
+    def prefill(self, other):
+        """
+        Copy cached KV from another LoopedKVCache into this one.
+        """
+        assert self.num_loops == other.num_loops, "Cannot prefill caches with different num_loops"
+        assert self.n_layers == other.n_layers and self.n_heads == other.n_heads and self.head_dim == other.head_dim
+        assert self.max_seq_len >= other.max_seq_len
+        for dst_cache, src_cache in zip(self.loop_caches, other.loop_caches):
+            dst_cache.prefill(src_cache)
+
 # -----------------------------------------------------------------------------
 @torch.inference_mode()
 def sample_next_token(logits, rng, temperature=1.0, top_k=None):
@@ -199,12 +267,17 @@ class Engine:
         # 1) Run a batch 1 prefill of the prompt tokens
         m = self.model.config
         kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
-        kv_cache_prefill = KVCache(
+        cache_cls = LoopedKVCache if getattr(m, "num_loops", 1) > 1 else KVCache
+        cache_kwargs = {}
+        if cache_cls is LoopedKVCache:
+            cache_kwargs["num_loops"] = m.num_loops
+        kv_cache_prefill = cache_cls(
             batch_size=1,
             seq_len=len(tokens),
             device=device,
             dtype=dtype,
             **kv_model_kwargs,
+            **cache_kwargs,
         )
         ids = torch.tensor([tokens], dtype=torch.long, device=device)
         logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
@@ -212,12 +285,13 @@ class Engine:
 
         # 2) Replicate the KV cache for each sample/row
         kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
-        kv_cache_decode = KVCache(
+        kv_cache_decode = cache_cls(
             batch_size=num_samples,
             seq_len=kv_length_hint,
             device=device,
             dtype=dtype,
             **kv_model_kwargs,
+            **cache_kwargs,
         )
         kv_cache_decode.prefill(kv_cache_prefill)
         del kv_cache_prefill # no need to keep this memory around

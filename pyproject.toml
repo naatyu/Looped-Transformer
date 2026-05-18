@@ -12,7 +12,7 @@ dependencies = [
     "rustbpe>=0.1.0",
     "tiktoken>=0.11.0",
     "tokenizers>=0.22.0",
-    "torch==2.9.1",
+    "torch>=2.9.1",
     "uvicorn>=0.36.0",
     "wandb>=0.21.3",
 ]
@@ -35,11 +35,12 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 
-# target torch to cuda 12.8 or CPU
+# target torch to cuda 12.8, cuda 13.2, or CPU
 [tool.uv.sources]
 torch = [
     { index = "pytorch-cpu", extra = "cpu" },
     { index = "pytorch-cu128", extra = "gpu" },
+    { index = "pytorch-cu132", extra = "gpu-cu132" },
 ]
 
 [[tool.uv.index]]
@@ -52,6 +53,11 @@ name = "pytorch-cu128"
 url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
+[[tool.uv.index]]
+name = "pytorch-cu132"
+url = "https://download.pytorch.org/whl/test/cu132"
+explicit = true
+
 [project.optional-dependencies]
 cpu = [
     "setuptools>=65.0.0",
@@ -60,6 +66,9 @@ cpu = [
 gpu = [
     "torch==2.9.1",
 ]
+gpu-cu132 = [
+    "torch==2.12.0",
+]
 
 [tool.uv]
 default-groups = []
@@ -67,5 +76,13 @@ conflicts = [
     [
         { extra = "cpu" },
         { extra = "gpu" },
+    ],
+    [
+        { extra = "cpu" },
+        { extra = "gpu-cu132" },
+    ],
+    [
+        { extra = "gpu" },
+        { extra = "gpu-cu132" },
     ],
 ]

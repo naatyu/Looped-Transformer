@@ -37,6 +37,9 @@ class GPTConfig:
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
     window_pattern: str = "SSSL"
+    num_loops: int = 1
+    entropy_beta: float = 0.01
+    exit_threshold: float = 0.5
 
 
 def norm(x):
@@ -87,7 +90,7 @@ class CausalSelfAttention(nn.Module):
             else None
         )
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, loop_idx=0):
         B, T, C = x.size()
 
         # Project the input to get queries, keys, and values
@@ -122,20 +125,28 @@ class CausalSelfAttention(nn.Module):
             )
         else:
             # Inference: use flash_attn_with_kvcache which handles cache management
-            k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+            if hasattr(kv_cache, "get_loop_cache"):
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx, loop_idx=loop_idx)
+                cache_seqlens = kv_cache.get_cache_seqlens(loop_idx)
+            else:
+                k_cache, v_cache = kv_cache.get_layer_cache(self.layer_idx)
+                cache_seqlens = kv_cache.cache_seqlens
             y = flash_attn.flash_attn_with_kvcache(
                 q,
                 k_cache,
                 v_cache,
                 k=k,
                 v=v,
-                cache_seqlens=kv_cache.cache_seqlens,
+                cache_seqlens=cache_seqlens,
                 causal=True,
                 window_size=window_size,
             )
             # Advance position after last layer processes
             if self.layer_idx == kv_cache.n_layers - 1:
-                kv_cache.advance(T)
+                if hasattr(kv_cache, "get_loop_cache"):
+                    kv_cache.advance(T, loop_idx=loop_idx)
+                else:
+                    kv_cache.advance(T)
 
         # Re-assemble the heads and project back to residual stream
         y = y.contiguous().view(B, T, -1)
@@ -162,8 +173,8 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config, layer_idx)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size, kv_cache):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache)
+    def forward(self, x, ve, cos_sin, window_size, kv_cache, loop_idx=0):
+        x = x + self.attn(norm(x), ve, cos_sin, window_size, kv_cache, loop_idx=loop_idx)
         x = x + self.mlp(norm(x))
         return x
 
@@ -236,6 +247,9 @@ class GPT(nn.Module):
             "cos", cos, persistent=False
         )  # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
+
+        # Exit probability head
+        self.exit_head = Linear(config.n_embd, 1, bias=False)
 
     @torch.no_grad()
     def init_weights(self):
@@ -403,7 +417,7 @@ class GPT(nn.Module):
             window = window_size[0]  # (left, right) tuple, we use left
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
-        num_flops_per_token = 6 * (nparams - nparams_exclude) + attn_flops
+        num_flops_per_token = (6 * (nparams - nparams_exclude) + attn_flops) * self.config.num_loops
         return num_flops_per_token
 
     def num_scaling_params(self):
@@ -422,6 +436,7 @@ class GPT(nn.Module):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
         value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
+        exit_head = sum(p.numel() for p in self.exit_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = (
             self.resid_lambdas.numel()
@@ -430,7 +445,7 @@ class GPT(nn.Module):
             + self.smear_lambda.numel()
             + self.backout_lambda.numel()
         )
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        total = wte + value_embeds + lm_head + exit_head + transformer_matrices + scalars
         assert total == sum(p.numel() for p in self.parameters()), (
             "Parameter count mismatch"
         )
@@ -438,6 +453,7 @@ class GPT(nn.Module):
             "wte": wte,
             "value_embeds": value_embeds,
             "lm_head": lm_head,
+            "exit_head": exit_head,
             "transformer_matrices": transformer_matrices,
             "scalars": scalars,
             "total": total,
@@ -459,14 +475,15 @@ class GPT(nn.Module):
         value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
+        exit_head_params = list(self.exit_head.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         smear_params = [self.smear_gate.weight, self.smear_lambda, self.backout_lambda]
         assert len(list(self.parameters())) == len(matrix_params) + len(
             embedding_params
-        ) + len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(
-            x0_params
-        ) + len(smear_params)
+        ) + len(lm_head_params) + len(exit_head_params) + len(value_embeds_params) + len(
+            resid_params
+        ) + len(x0_params) + len(smear_params)
 
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (tuned for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -525,6 +542,14 @@ class GPT(nn.Module):
                 eps=1e-10,
                 weight_decay=0.0,
             ),
+            dict(
+                kind="adamw",
+                params=exit_head_params,
+                lr=scalar_lr,
+                betas=(0.8, 0.95),
+                eps=1e-10,
+                weight_decay=0.0,
+            ),
         ]
         # Muon groups (matrix params, grouped by shape for stacking)
         for shape in sorted({p.shape for p in matrix_params}):
@@ -574,6 +599,8 @@ class GPT(nn.Module):
         )  # ensure activations are in compute dtype (no-op usually, but active for fp16 code path)
         x = norm(x)
 
+        use_loop_cache = kv_cache is not None and hasattr(kv_cache, "get_loop_cache")
+
         # Smear: mix previous token's embedding into current position (cheap bigram info)
         if kv_cache is None:
             # Training / naive generate: full sequence available, use fast slice
@@ -582,6 +609,20 @@ class GPT(nn.Module):
                 self.smear_gate(x[:, 1:, :24])
             )
             x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+        elif use_loop_cache:
+            # Looped KV cache: keep smear state shared across loop-specific caches
+            x_pre_smear = kv_cache.prev_embedding
+            if T > 1:
+                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
+                    self.smear_gate(x[:, 1:, :24])
+                )
+                x = torch.cat([x[:, :1], x[:, 1:] + gate * x[:, :-1]], dim=1)
+            elif x_pre_smear is not None:
+                gate = self.smear_lambda.to(x.dtype) * torch.sigmoid(
+                    self.smear_gate(x[:, :, :24])
+                )
+                x = x + gate * x_pre_smear
+            kv_cache.prev_embedding = x[:, -1:, :]
         else:
             # KV cache inference: read prev embedding from cache, store current for next step
             x_pre_smear = kv_cache.prev_embedding
@@ -604,43 +645,104 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
-        for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = (
-                self.value_embeds[str(i)](idx).to(x.dtype)
-                if str(i) in self.value_embeds
-                else None
-            )
-            x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
-            if i == backout_layer:
-                x_backout = x
-        # Subtract mid-layer residual to remove low-level features before logit projection
-        if x_backout is not None:
-            x = x - self.backout_lambda.to(x.dtype) * x_backout
-        x = norm(x)
 
-        # Forward the lm_head (compute logits)
-        softcap = 15  # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(
-            x
-        )  # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., : self.config.vocab_size]  # slice to remove padding
-        logits = logits.float()  # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap)  # squash the logits
+        loop_token_losses = []
+        loop_seq_losses = []
+        loop_stop_probs = []
+        finished = None
+        num_loops = self.config.num_loops if (kv_cache is None or use_loop_cache) else 1
+        for loop in range(num_loops):
+            loop_kv_cache = None
+            if kv_cache is not None:
+                loop_kv_cache = kv_cache.get_loop_cache(loop) if use_loop_cache else kv_cache
+            x_prev = x
+            for i, block in enumerate(self.transformer.h):
+                x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
+                ve = (
+                    self.value_embeds[str(i)](idx).to(x.dtype)
+                    if str(i) in self.value_embeds
+                    else None
+                )
+                x = block(x, ve, cos_sin, self.window_sizes[i], loop_kv_cache, loop_idx=loop)
+                if i == backout_layer:
+                    x_backout = x
 
-        if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                targets.view(-1),
-                ignore_index=-1,
-                reduction=loss_reduction,
-            )
-            return loss
-        else:
-            # inference: just return the logits directly
+            # Subtract mid-layer residual to remove low-level features before logit projection
+            if x_backout is not None:
+                x = x - self.backout_lambda.to(x.dtype) * x_backout
+            x = norm(x)
+
+            if targets is None and not use_loop_cache:
+                if finished is None:
+                    finished = torch.zeros(B, dtype=torch.bool, device=idx.device)
+                # Rows that have already exited keep their previous committed state.
+                # Rows that are still active take the newly computed loop state.
+                x = torch.where(finished[:, None, None], x_prev, x)
+
+            # Forward the lm_head (compute logits)
+            softcap = 15  # smoothly cap the logits to the range [-softcap, softcap]
+            logits = self.lm_head(
+                x
+            )  # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
+            logits = logits[..., : self.config.vocab_size]  # slice to remove padding
+            logits = (
+                logits.float()
+            )  # switch to fp32 for logit softcap and loss computation
+            logits = softcap * torch.tanh(logits / softcap)  # squash the logits
+
+            # Compute stop probability for this loop
+            stop_prob = torch.sigmoid(self.exit_head(x[:, -1])).squeeze(-1)
+            loop_stop_probs.append(stop_prob)
+
+            if targets is not None:
+                # training: given the targets, compute and return the loss
+                # TODO experiment with chunked cross-entropy?
+                token_loss = F.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    ignore_index=-1,
+                    reduction="none",
+                )
+                token_loss = token_loss.view(B, T)
+                loop_token_losses.append(token_loss)
+
+                if loss_reduction != "none":
+                    valid = (targets >= 0).to(token_loss.dtype)
+                    if loss_reduction == "mean":
+                        denom = valid.sum(dim=1).clamp(min=1)
+                        seq_loss = (token_loss * valid).sum(dim=1) / denom
+                    elif loss_reduction == "sum":
+                        seq_loss = (token_loss * valid).sum(dim=1)
+                    else:
+                        raise ValueError(
+                            f"Unsupported loss_reduction={loss_reduction!r} in LoopedGPT"
+                        )
+                    loop_seq_losses.append(seq_loss)
+
+            else:
+                finished = finished | (stop_prob > self.config.exit_threshold)
+                if finished.all():
+                    return logits
+
+        if targets is None:
             return logits
+
+        if loss_reduction == "none":
+            return loop_token_losses[-1].view(-1)
+
+        exit_distribution = []
+        current_reminder = torch.ones(B, dtype=loop_stop_probs[0].dtype, device=idx.device)
+        for p in loop_stop_probs:
+            exit_distribution.append(p * current_reminder)
+            current_reminder = current_reminder * (1 - p)
+
+        total_loss = sum(q * loss for q, loss in zip(exit_distribution, loop_seq_losses))
+        entropy = -sum(q * torch.log(q + 1e-10) for q in exit_distribution)
+        total_loss = total_loss - self.config.entropy_beta * entropy
+
+        if loss_reduction == "sum":
+            return total_loss.sum()
+        return total_loss.mean()
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

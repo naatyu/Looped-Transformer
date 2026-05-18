@@ -26,6 +26,15 @@ def _patch_missing_config_keys(model_config_kwargs):
     if "window_pattern" not in model_config_kwargs:
         model_config_kwargs["window_pattern"] = "L"
         log0(f"Patching missing window_pattern in model config to 'L'")
+    if "num_loops" not in model_config_kwargs:
+        model_config_kwargs["num_loops"] = 1
+        log0("Patching missing num_loops in model config to 1")
+    if "entropy_beta" not in model_config_kwargs:
+        model_config_kwargs["entropy_beta"] = 0.01
+        log0("Patching missing entropy_beta in model config to 0.01")
+    if "exit_threshold" not in model_config_kwargs:
+        model_config_kwargs["exit_threshold"] = 0.5
+        log0("Patching missing exit_threshold in model config to 0.5")
 
 def _patch_missing_keys(model_data, model_config):
     """Add default values for new parameters that may be missing in old checkpoints."""
@@ -93,12 +102,25 @@ def build_model(checkpoint_dir, step, device, phase):
     # Hack: fix torch compile issue, which prepends all keys with _orig_mod.
     model_data = {k.removeprefix("_orig_mod."): v for k, v in model_data.items()}
     model_config_kwargs = meta_data["model_config"]
+    model_impl = meta_data.get("model_impl")
     _patch_missing_config_keys(model_config_kwargs)
     log0(f"Building model with config: {model_config_kwargs}")
-    model_config = GPTConfig(**model_config_kwargs)
+    use_looped = model_impl == "looped" or model_config_kwargs.get("num_loops", 1) > 1
+    if use_looped:
+        from nanochat.loopedgpt import GPT as LoopGPT, GPTConfig as LoopGPTConfig
+        model_config = LoopGPTConfig(**model_config_kwargs)
+        model_cls = LoopGPT
+    else:
+        model_config_kwargs = {
+            k: v
+            for k, v in model_config_kwargs.items()
+            if k not in {"num_loops", "entropy_beta", "exit_threshold"}
+        }
+        model_config = GPTConfig(**model_config_kwargs)
+        model_cls = GPT
     _patch_missing_keys(model_data, model_config)
     with torch.device("meta"):
-        model = GPT(model_config)
+        model = model_cls(model_config)
     # Load the model state
     model.to_empty(device=device)
     model.init_weights() # note: this is dumb, but we need to init the rotary embeddings. TODO: fix model re-init
