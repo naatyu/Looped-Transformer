@@ -133,6 +133,8 @@ def main():
     parser.add_argument("--depth", type=int, default=4)
     parser.add_argument("--head-dim", type=int, default=64)
     parser.add_argument("--num-loops", type=int, default=2)
+    parser.add_argument("--entropy-beta", type=float, default=0.01)
+    parser.add_argument("--exit-threshold", type=float, default=0.5)
     parser.add_argument("--steps", type=int, default=20)
     parser.add_argument("--warmup-steps", type=int, default=5)
     parser.add_argument("--eval-every", type=int, default=5)
@@ -177,8 +179,8 @@ def main():
         LoopedGPTConfig(
             **common_kwargs,
             num_loops=args.num_loops,
-            entropy_beta=0.01,
-            exit_threshold=0.5,
+            entropy_beta=args.entropy_beta,
+            exit_threshold=args.exit_threshold,
         ),
         device,
     )

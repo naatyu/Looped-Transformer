@@ -1,223 +1,223 @@
-# nanochat
+# Looped Transformer
 
-![nanochat logo](dev/nanochat.png)
-![scaling laws](dev/scaling_laws_jan26.png)
+This repo is a fork of `nanochat`, repurposed as a small experimental for **looped transformers** (or recurrent transformers if you prefer).
 
-nanochat is the simplest experimental harness for training LLMs. It is designed to run on a single GPU node, the code is minimal/hackable, and it covers all major LLM stages including tokenization, pretraining, finetuning, evaluation, inference, and a chat UI. For example, you can train your own GPT-2 capability LLM (which cost ~$43,000 to train in 2019) for only $48 (~2 hours of 8XH100 GPU node) and then talk to it in a familiar ChatGPT-like web UI. On a spot instance, the total cost can be closer to ~$15. More generally, nanochat is configured out of the box to train an entire miniseries of compute-optimal models by setting one single complexity dial: `--depth`, the number of layers in the GPT transformer model (GPT-2 capability happens to be approximately depth 26). All other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) are calculated automatically in an optimal way.
+I saw all the hype around Claude Mythos and one claim about it made me curious: "It may be a recurrent transformer". I started to be curious (and if it powers one of the most powerful llm it must be good) and found this https://ouro-llm.github.io/ (it was not that hard). I found the idea very cool and wanted to experiment it myself, or atleast implement it.
 
-For questions about the repo, I recommend either using [DeepWiki](https://deepwiki.com/karpathy/nanochat) from Devin/Cognition to ask questions about the repo, or use the [Discussions tab](https://github.com/karpathy/nanochat/discussions), or come by the [#nanochat](https://discord.com/channels/1020383067459821711/1427295580895314031) channel on Discord.
+The looped implementation lives in [nanochat/loopedgpt.py](/home/nathan/dev/looped-transformer/nanochat/loopedgpt.py). It is wired into the existing training, evaluation, checkpoint, and inference codepaths so you can compare looped and classical models inside the same harness.
 
-## Time-to-GPT-2 Leaderboard
+## What Is A Looped Transformer?
 
-Presently, the main focus of development is on tuning the pretraining stage, which takes the most amount of compute. Inspired by the modded-nanogpt repo and to incentivise progress and community collaboration, nanochat maintains a leaderboard for a "GPT-2 speedrun", which is the wall-clock time required to train a nanochat model to GPT-2 grade capability, as measured by the DCLM CORE score. The [runs/speedrun.sh](runs/speedrun.sh) script always reflects the reference way to train GPT-2 grade model and talk to it. The current leaderboard looks as follows:
+Instead of stacking many unique blocks:
 
-| # | time | val_bpb | CORE | Description | Date | Commit | Contributors |
-|---|-------------|---------|------|-------------|------|--------|--------------|
-| 0 | 168 hours | - | 0.2565 | Original OpenAI GPT-2 checkpoint | 2019 | - | OpenAI |
-| 1 | 3.04 | 0.74833 | 0.2585 | d24 baseline, slightly overtrained | Jan 29 2026 | 348fbb3 | @karpathy |
-| 2 | 2.91 | 0.74504 | 0.2578 | d26 slightly undertrained **+fp8** | Feb 2 2026 | a67eba3 | @karpathy |
-| 3 | 2.76 | 0.74645 | 0.2602 | bump total batch size to 1M tokens | Feb 5 2026 | 2c062aa | @karpathy |
-| 4 | 2.02 | 0.71854 | 0.2571 | change dataset to NVIDIA ClimbMix | Mar 4 2026 | 324e69c | @ddudek @karpathy |
-| 5 | 1.80 | 0.71808 | 0.2690 | autoresearch [round 1](https://x.com/karpathy/status/2031135152349524125) | Mar 9 2026 | 6ed7d1d | @karpathy |
-| 6 | 1.65 | 0.71800 | 0.2626 | autoresearch round 2 | Mar 14 2026 | a825e63 | @karpathy |
+```text
+Layer1 -> Layer2 -> Layer3 -> ... -> LayerN
+```
 
-The primary metric we care about is "time to GPT-2" - the wall clock time needed to outperform the GPT-2 (1.6B) CORE metric on an 8XH100 GPU node. The GPT-2 CORE score is 0.256525. In 2019, the training of GPT-2 cost approximately $43,000 so it is incredible that due to many advances over 7 years across the stack, we can now do so much faster and for well below $100 (e.g. at the current ~$3/GPU/hr, an 8XH100 node is ~$24/hr, so 2 hours is ~$48).
+a looped transformer reuses the same block repeatedly:
 
-See [dev/LEADERBOARD.md](dev/LEADERBOARD.md) for more docs on how to interpret and contribute to the leaderboard.
+```text
+Block -> Block -> Block -> Block
+```
 
-## Getting started
+with shared weights.
 
-### Setup
+Conceptually, the hidden state is refined over internal steps:
 
-nanochat uses [uv](https://docs.astral.sh/uv/) for dependency management. To install:
+```text
+h0 -> h1 -> h2 -> h3 -> ... -> hT
+```
+
+This fork currently supports:
+
+- repeated application of the same transformer trunk
+- logits computed after every loop
+- per-loop supervision during training
+- a learned exit head for adaptive stopping
+- expected-loss training over loop exit probabilities
+- entropy regularization on the exit distribution
+
+Why this is interesting:
+
+- a standard transformer gets one forward pass to form an answer
+- a looped transformer gets several internal refinement steps
+- this trades **parameters** for **compute**
+- easy examples can stop early, harder examples can use more internal work
+
+## How Training Works In The Looped Model
+
+The model computes logits after every loop, not just at the end.
+
+The looped forward path is roughly:
+
+```python
+h = embed(tokens)
+
+for t in range(num_loops):
+    h = block(h)
+    logits_t = lm_head(h)
+    p_t = sigmoid(exit_head(h[:, -1]))
+```
+
+For training, each loop gets its own CE loss:
+
+```python
+loss_t = cross_entropy(logits_t, target)
+```
+
+The exit head predicts a stop probability `p_t` after each loop. Those probabilities are converted into an exit distribution over exact stopping depths:
+
+```python
+q1 = p1
+q2 = (1 - p1) * p2
+q3 = (1 - p1) * (1 - p2) * p3
+```
+
+The final objective is the expected loss over loop depth:
+
+```python
+total_loss = sum(q_t * loss_t for q_t, loss_t in zip(q, losses))
+```
+
+with entropy regularization:
+
+```python
+total_loss = expected_loss - beta * entropy(q)
+```
+
+Training uses:
+
+1. per-loop cross-entropy
+2. a stopping distribution derived from the exit probabilities
+3. expected loss over exit depth
+4. entropy regularization to avoid collapse to always-early or always-late exit
+
+NOTE: the exit head is not trained with hand-labeled "correct loop counts". It learns indirectly through the total loss. If stopping early hurts, gradients push early stop probabilities down. If later loops do not help much, gradients push earlier stopping up.
+
+The compatibility rule in this repo is:
+
+- `loss_reduction="mean"` uses the loop-aware objective
+- `loss_reduction="none"` preserves the old tokenwise loss contract for existing eval code
+
+## Experiment results
+
+| steps | model | final_bpb | mean_bpb | step_sec | tok/sec | peak_mem_mb |
+|---:|---|---:|---:|---:|---:|---:|
+| 1k | gpt | 3.0590 | 3.1646 | 0.0395 | 25934.4 | 2003.1 |
+|  | looped | 2.8226 | 2.7713 | 0.1188 | 8618.4 | 3806.5 |
+| 5k | gpt | 3.0650 | 3.0785 | 0.0400 | 25607.7 | 2003.1 |
+|  | looped | 2.7003 | 2.7230 | 0.1050 | 9755.5 | 3312.0 |
+| 20k | gpt | 3.1202 | 3.0264 | 0.0396 | 25831.0 | 2003.1 |
+|  | looped | 2.5316 | 2.6012 | 0.1007 | 10168.1 | 3312.0 |
+
+To reproduce:
+```bash
+UV_EXTRA=gpu-cu132 uv run --extra gpu-cu132 python -m scripts.bench_looplm \
+--device-type cuda \
+--depth 8 \
+--sequence-len 512 \
+--batch-size 2 \
+--num-loops 3 \
+--entropy-beta 0.02 \
+--exit-threshold 0.7 \
+--steps 20000 \
+--warmup-steps 5 \
+--eval-every 5 \
+--num-batches 8 \
+--eval-batches 4 \
+--window-pattern L
+```
+
+**DISCLAIMER**: this test was done at small scale on a single GPU and may absolutely not reflect what happens at large scale.
+
+We can actually observe, if I did not make any mistake in the implementation, that looped models perform better than standard models. This suggests that looping transformer blocks actually make the model stronger with the same parameter budget. \
+It is also apparently stronger on MOE models than on dense models: https://arxiv.org/html/2605.09165v1. This could be explained by the fact that at each loop you can use a new set of experts that you did not use before, adding more expert diversity.
+
+### My take
+
+I do not think this is likely to be what is behind Mythos, and the main reason is *inference*.
+
+From a training perspective, this method is very interesting. Looped transformers shift more test-time compute into latent-space refinement before producing the next token. That gives the model several internal passes to improve the representation without increasing the parameter count in the usual way. In practice, that can make a model more capable for a fixed parameter budget, or let a smaller model stay competitive with a larger dense model if the extra internal compute is worth it.
+
+From an inference perspective, though, things get much more awkward. With an adaptive exit mechanism, different sequences in the same batch may want different numbers of loops. That makes serving harder, because compute per token is no longer uniform across the batch. Current inference engines are built around much more regular execution patterns, so supporting looped transformers efficiently would likely require new batching and scheduling logic rather than a small patch on top of existing systems.
+
+The KV-cache handling also gets worse. In a dense transformer, cache state is indexed by layer and token position. In a looped transformer, each loop produces a different internal state, so the cache effectively becomes indexed by loop, layer, and token position. That means the memory footprint of the cache grows with the number of loops, which pushes against the current desire for long context and cheap decoding.
+
+So while this idea is very attractive and have strong advantages, I think the inference stack is currently not ready (at least for millions of users), this represent a way too massive shift for Anthropic.
+
+## Repo Focus
+
+This is not a clean-room recurrent-transformer codebase. It is a pragmatic fork of `nanochat` used for experiments. That means:
+
+- the standard GPT path still exists in [nanochat/gpt.py](/home/nathan/dev/looped-transformer/nanochat/gpt.py)
+- the looped model is opt-in through `--model-impl=looped`
+- most training and eval scripts are shared between classical GPT and LoopLM
+- some repo documentation from upstream still exists in code comments and helper scripts
+
+The useful part is that you can do apples-to-apples comparisons with the same tokenizer, dataloaders, optimizer stack, eval path, and checkpoint format.
+
+## Main Entry Points
+
+### Train a looped model
 
 ```bash
-uv sync --extra gpu       # Use for CUDA 12.8 (A100/H100/etc.)
-uv sync --extra gpu-cu132 # Use for CUDA 13.2
-uv sync --extra cpu       # (or) Use for CPU-only / MPS
-source .venv/bin/activate
+UV_EXTRA=gpu-cu132 uv run --extra gpu-cu132 python -m scripts.base_train -- \
+  --model-impl=looped \
+  --num-loops=2 \
+  --entropy-beta=0.01 \
+  --exit-threshold=0.5 \
+  --depth=8 \
+  --num-iterations=100
 ```
 
-For development (adds pytest, matplotlib, ipykernel, transformers, etc.):
+Important flags:
+
+- `--model-impl {gpt,looped}` selects the architecture
+- `--num-loops` sets how many recurrent passes the looped model takes
+- `--entropy-beta` sets the entropy regularization weight on the loop exit distribution
+- `--exit-threshold` sets the inference-time stopping threshold for the exit head
+
+## Looped Speedrun Variant
+
+There is also a looped-model version of the original multi-GPU speedrun:
 
 ```bash
-uv sync --extra gpu --group dev
+bash runs/speedrun_looplm.sh
 ```
 
-### Reproduce and talk to GPT-2
+That script mirrors the upstream flow more closely and is meant for larger hardware, not a single 16 GB GPU.
 
-The most fun you can have is to train your own GPT-2 and talk to it. The entire pipeline to do so is contained in the single file [runs/speedrun.sh](runs/speedrun.sh), which is designed to be run on an 8XH100 GPU node. Boot up a new 8XH100 GPU box from your favorite provider (e.g. I use and like [Lambda](https://lambda.ai/service/gpu-cloud)), and kick off the training script:
+## Benchmarking GPT vs LoopLM
+
+For a direct comparison between the classical and looped implementations, use:
 
 ```bash
-bash runs/speedrun.sh
+UV_EXTRA=gpu-cu132 uv run --extra gpu-cu132 python -m scripts.bench_looplm --device-type cuda
 ```
 
-You may wish to do so in a screen session as this will take ~3 hours to run. Once it's done, you can talk to it via the ChatGPT-like web UI. Make sure again that your local uv virtual environment is active (run `source .venv/bin/activate`), and serve it:
+This benchmark:
 
-```bash
-python -m scripts.chat_web
-```
+- trains both models on the same train batches
+- evaluates on held-out validation batches
+- reports validation BPB
+- keeps the tokenizer, optimizer, and data pipeline fixed
 
-And then visit the URL shown. Make sure to access it correctly, e.g. on Lambda use the public IP of the node you're on, followed by the port, so for example [http://209.20.xxx.xxx:8000/](http://209.20.xxx.xxx:8000/), etc. Then talk to your LLM as you'd normally talk to ChatGPT! Get it to write stories or poems. Ask it to tell you who you are to see a hallucination. Ask it why the sky is blue. Or why it's green. The speedrun is a 4e19 FLOPs capability model so it's a bit like talking to a kindergartener :).
+## Inference / KV Cache
 
----
+Looped inference is integrated into the existing engine path:
 
-<img width="2672" height="1520" alt="image" src="https://github.com/user-attachments/assets/ed39ddf8-2370-437a-bedc-0f39781e76b5" />
+- standard GPT uses `KVCache`
+- looped GPT uses `LoopedKVCache`
 
----
+Each loop keeps its own KV state so recurrent passes do not overwrite one another. The implementation is in [nanochat/engine.py](/home/nathan/dev/looped-transformer/nanochat/engine.py).
 
-A few more notes:
+## Useful Files
 
-- The code will run just fine on the Ampere 8XA100 GPU node as well, but a bit slower.
-- All code will run just fine on even a single GPU by omitting `torchrun`, and will produce ~identical results (code will automatically switch to gradient accumulation), but you'll have to wait 8 times longer.
-- If your GPU(s) have less than 80GB, you'll have to tune some of the hyperparameters or you will OOM / run out of VRAM. Look for `--device-batch-size` in the scripts and reduce it until things fit. E.g. from 32 (default) to 16, 8, 4, 2, or even 1. Less than that you'll have to know a bit more what you're doing and get more creative.
-- Most of the code is fairly vanilla PyTorch so it should run on anything that supports that - xpu, mps, or etc, but I haven't personally exercised all of these code paths so there might be sharp edges.
-
-## Research
-
-If you are a researcher and wish to help improve nanochat, two scripts of interest are [runs/scaling_laws.sh](runs/scaling_laws.sh) and [runs/miniseries.sh](runs/miniseries.sh). See [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) for related documentation. For quick experimentation (~5 min pretraining runs) my favorite scale is to train a 12-layer model (GPT-1 sized), e.g. like this:
-
-```
-OMP_NUM_THREADS=1 torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- \
-    --depth=12 \
-    --run="d12" \
-    --model-tag="d12" \
-    --core-metric-every=999999 \
-    --sample-every=-1 \
-    --save-every=-1 \
-```
-
-This uses wandb (run name "d12"), only runs the CORE metric on last step, and it doesn't sample and save intermediate checkpoints. I like to change something in the code, re-run a d12 (or a d16 etc) and see if it helped, in an iteration loop. To see if a run helps, I like to monitor the wandb plots for:
-
-1. `val_bpb` (validation loss in vocab-size-invariant units of bits per byte) as a function of `step`, `total_training_time` and `total_training_flops`.
-2. `core_metric` (the DCLM CORE score)
-3. VRAM utilization, `train/mfu` (Model FLOPS utilization), `train/tok_per_sec` (training throughput)
-
-See an example [here](https://github.com/karpathy/nanochat/pull/498#issuecomment-3850720044).
-
-The important thing to note is that nanochat is written and configured around one single dial of complexity - the depth of the transformer. This single integer automatically determines all other hyperparameters (the width of the transformer, number of heads, learning rate adjustments, training horizons, weight decays, ...) so that the trained model comes out compute optimal. The idea is that the user doesn't have to think about or set any of this, they are simply asking for a smaller or bigger model using `--depth`, and everything "just works". By sweeping out the depth, you achieve the nanochat miniseries of compute optimal models at various sizes. GPT-2 capability model (which is of most interest at the moment) happens to be somewhere around d24-d26 range with the current code. But any candidate changes to the repo have to be principled enough that they work for all settings of depth.
-
-## Running on CPU / MPS
-
-The script [runs/runcpu.sh](runs/runcpu.sh) shows a very simple example of running on CPU or Apple Silicon. It dramatically shrinks the LLM that is being trained to make things fit into a reasonable time interval of a few ten minutes of training. You will not get strong results in this way.
-
-## Precision / dtype
-
-nanochat does not use `torch.amp.autocast`. Instead, precision is managed explicitly through a single global `COMPUTE_DTYPE` (defined in `nanochat/common.py`). By default this is auto-detected based on your hardware:
-
-| Hardware | Default dtype | Why |
-|----------|--------------|-----|
-| CUDA SM 80+ (A100, H100, ...) | `bfloat16` | Native bf16 tensor cores |
-| CUDA SM < 80 (V100, T4, ...) | `float32` | No bf16; fp16 available via `NANOCHAT_DTYPE=float16` (uses GradScaler) |
-| CPU / MPS | `float32` | No reduced-precision tensor cores |
-
-You can override the default with the `NANOCHAT_DTYPE` environment variable:
-
-```bash
-NANOCHAT_DTYPE=float32 python -m scripts.chat_cli -p "hello"   # force fp32
-NANOCHAT_DTYPE=bfloat16 torchrun --nproc_per_node=8 -m scripts.base_train  # force bf16
-```
-
-How it works: model weights are stored in fp32 (for optimizer precision), but our custom `Linear` layer casts them to `COMPUTE_DTYPE` during the forward pass. Embeddings are stored directly in `COMPUTE_DTYPE` to save memory. This gives us the same mixed-precision benefit as autocast but with full explicit control over what runs in which precision.
-
-Note: `float16` training automatically enables a `GradScaler` in `base_train.py` to prevent gradient underflow. SFT supports this too but RL currently does not. Inference in fp16 works fine everywhere.
-
-## Guides
-
-I've published a number of guides that might contain helpful information, most recent to least recent:
-
-- [Feb 1 2026: Beating GPT-2 for <<$100: the nanochat journey](https://github.com/karpathy/nanochat/discussions/481)
-- [Jan 7 miniseries v1](https://github.com/karpathy/nanochat/discussions/420) documents the first nanochat miniseries of models.
-- To add new abilities to nanochat, see [Guide: counting r in strawberry (and how to add abilities generally)](https://github.com/karpathy/nanochat/discussions/164).
-- To customize your nanochat, see [Guide: infusing identity to your nanochat](https://github.com/karpathy/nanochat/discussions/139) in Discussions, which describes how you can tune your nanochat's personality through synthetic data generation and mixing that data into the SFT stage.
-- [Oct 13 2025: original nanochat post](https://github.com/karpathy/nanochat/discussions/1) introducing nanochat, though now it contains some deprecated information and the model is a lot older (with worse results) than current master.
-
-## File structure
-
-```
-.
-├── LICENSE
-├── README.md
-├── dev
-│   ├── gen_synthetic_data.py       # Example synthetic data for identity
-│   ├── generate_logo.html
-│   ├── nanochat.png
-│   └── repackage_data_reference.py # Pretraining data shard generation
-├── nanochat
-│   ├── __init__.py                 # empty
-│   ├── checkpoint_manager.py       # Save/Load model checkpoints
-│   ├── common.py                   # Misc small utilities, quality of life
-│   ├── core_eval.py                # Evaluates base model CORE score (DCLM paper)
-│   ├── dataloader.py               # Tokenizing Distributed Data Loader
-│   ├── dataset.py                  # Download/read utils for pretraining data
-│   ├── engine.py                   # Efficient model inference with KV Cache
-│   ├── execution.py                # Allows the LLM to execute Python code as tool
-│   ├── gpt.py                      # The GPT nn.Module Transformer
-│   ├── logo.svg
-│   ├── loss_eval.py                # Evaluate bits per byte (instead of loss)
-│   ├── optim.py                    # AdamW + Muon optimizer, 1GPU and distributed
-│   ├── report.py                   # Utilities for writing the nanochat Report
-│   ├── tokenizer.py                # BPE Tokenizer wrapper in style of GPT-4
-│   └── ui.html                     # HTML/CSS/JS for nanochat frontend
-├── pyproject.toml
-├── runs
-│   ├── miniseries.sh               # Miniseries training script
-│   ├── runcpu.sh                   # Small example of how to run on CPU/MPS
-│   ├── scaling_laws.sh             # Scaling laws experiments
-│   └── speedrun.sh                 # Train the ~$100 nanochat d20
-├── scripts
-│   ├── base_eval.py                # Base model: CORE score, bits per byte, samples
-│   ├── base_train.py               # Base model: train
-│   ├── chat_cli.py                 # Chat model: talk to over CLI
-│   ├── chat_eval.py                # Chat model: eval tasks
-│   ├── chat_rl.py                  # Chat model: reinforcement learning
-│   ├── chat_sft.py                 # Chat model: train SFT
-│   ├── chat_web.py                 # Chat model: talk to over WebUI
-│   ├── tok_eval.py                 # Tokenizer: evaluate compression rate
-│   └── tok_train.py                # Tokenizer: train it
-├── tasks
-│   ├── arc.py                      # Multiple choice science questions
-│   ├── common.py                   # TaskMixture | TaskSequence
-│   ├── customjson.py               # Make Task from arbitrary jsonl convos
-│   ├── gsm8k.py                    # 8K Grade School Math questions
-│   ├── humaneval.py                # Misnomer; Simple Python coding task
-│   ├── mmlu.py                     # Multiple choice questions, broad topics
-│   ├── smoltalk.py                 # Conglomerate dataset of SmolTalk from HF
-│   └── spellingbee.py              # Task teaching model to spell/count letters
-├── tests
-│   └── test_engine.py
-└── uv.lock
-```
-
-## Contributing
-
-The goal of nanochat is to improve the state of the art in micro models that are accessible to work with end to end on budgets of < $1000 dollars. Accessibility is about overall cost but also about cognitive complexity - nanochat is not an exhaustively configurable LLM "framework"; there are no giant configuration objects, model factories, or if-then-else monsters in the code base. It is a single, cohesive, minimal, readable, hackable, maximally-forkable "strong baseline" codebase designed to run start to end and produce a ChatGPT model you can talk to. Currently, the most interesting part personally is speeding up the latency to GPT-2 (i.e. getting a CORE score above 0.256525). Currently this takes ~3 hours, but by improving the pretraining stage we can improve this further.
-
-Current AI policy: disclosure. When submitting a PR, please declare any parts that had substantial LLM contribution and that you have not written or that you do not fully understand.
-
-## Acknowledgements
-
-- The name (nanochat) derives from my earlier project [nanoGPT](https://github.com/karpathy/nanoGPT), which only covered pretraining.
-- nanochat is also inspired by [modded-nanoGPT](https://github.com/KellerJordan/modded-nanogpt), which gamified the nanoGPT repo with clear metrics and a leaderboard, and borrows a lot of its ideas and some implementation for pretraining.
-- Thank you to [HuggingFace](https://huggingface.co/) for fineweb and smoltalk.
-- Thank you [Lambda](https://lambda.ai/service/gpu-cloud) for the compute used in developing this project.
-- Thank you to chief LLM whisperer 🧙‍♂️ Alec Radford for advice/guidance.
-- Thank you to the repo czar Sofie [@svlandeg](https://github.com/svlandeg) for help with managing issues, pull requests and discussions of nanochat.
-
-## Cite
-
-If you find nanochat helpful in your research cite simply as:
-
-```bibtex
-@misc{nanochat,
-  author = {Andrej Karpathy},
-  title = {nanochat: The best ChatGPT that \$100 can buy},
-  year = {2025},
-  publisher = {GitHub},
-  url = {https://github.com/karpathy/nanochat}
-}
-```
+- [nanochat/loopedgpt.py](/home/nathan/dev/looped-transformer/nanochat/loopedgpt.py): looped model implementation especially `forward()`
+- [scripts/bench_looplm.py](/home/nathan/dev/looped-transformer/scripts/bench_looplm.py): local GPT vs LoopLM benchmark
+- [runs/speedrun_16gb.sh](/home/nathan/dev/looped-transformer/runs/speedrun_16gb.sh): safer one-GPU run
+- [runs/speedrun_looplm.sh](/home/nathan/dev/looped-transformer/runs/speedrun_looplm.sh): looped speedrun variant
 
 ## License
 
-MIT
+MIT. The fork inherits the upstream `nanochat` license.

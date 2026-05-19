@@ -55,6 +55,8 @@ parser.add_argument("--max-seq-len", type=int, default=2048, help="max context l
 parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
 parser.add_argument("--model-impl", type=str, default="gpt", choices=["gpt", "looped"], help="model implementation to train")
 parser.add_argument("--num-loops", type=int, default=2, help="number of loop iterations for looped model")
+parser.add_argument("--entropy-beta", type=float, default=0.01, help="entropy regularization weight for looped model exit distribution")
+parser.add_argument("--exit-threshold", type=float, default=0.5, help="inference stop threshold for looped model exit head")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -155,8 +157,8 @@ def build_model_meta(depth):
     if args.model_impl == "looped":
         config_kwargs.update(
             num_loops=args.num_loops,
-            entropy_beta=0.01,
-            exit_threshold=0.5,
+            entropy_beta=args.entropy_beta,
+            exit_threshold=args.exit_threshold,
         )
     config = config_cls(**config_kwargs)
     with torch.device("meta"):
