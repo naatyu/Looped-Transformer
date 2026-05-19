@@ -133,7 +133,7 @@ UV_EXTRA=gpu-cu132 uv run --extra gpu-cu132 python -m scripts.bench_looplm \
 We can actually observe, if I did not make any mistake in the implementation, that looped models perform better than standard models. This suggests that looping transformer blocks actually make the model stronger with the same parameter budget. \
 It is also apparently stronger on MOE models than on dense models: https://arxiv.org/html/2605.09165v1. This could be explained by the fact that at each loop you can use a new set of experts that you did not use before, adding more expert diversity.
 
-### My take
+### My first take
 
 I do not think this is likely to be what is behind Mythos, and the main reason is *inference*.
 
@@ -144,6 +144,45 @@ From an inference perspective, though, things get much more awkward. With an ada
 The KV-cache handling also gets worse. In a dense transformer, cache state is indexed by layer and token position. In a looped transformer, each loop produces a different internal state, so the cache effectively becomes indexed by loop, layer, and token position. That means the memory footprint of the cache grows with the number of loops, which pushes against the current desire for long context and cheap decoding.
 
 So while this idea is very attractive and have strong advantages, I think the inference stack is currently not ready (at least for millions of users), this represent a way too massive shift for Anthropic.
+
+### 2nd lecture
+
+After watching this: https://www.youtube.com/watch?v=pDsTcrRVNc0 and reading this: https://arxiv.org/html/2605.09165v1, I think my first take was directionally right on the systems difficulty, but too pessimistic and not precise enough on the benchmarks.
+
+The benchmark above is encouraging, but it is mostly a **stored-parameter efficiency** result, not a compute-efficiency result. The looped model gets much better BPB than the standard GPT in this setup, but it also runs much slower, this is expected but still, we have a $\times 2.5$ slowdown.
+
+So the conclusion is not "looping is strictly better than a normal transformer." The better conclusion is:
+
+> for a similar stored parameter budget, spending extra recurrent compute in latent space can buy better loss.
+
+This matches the Ouro thesis: looping gives a third scaling axis. Instead of only scaling parameters and tokens, we can also scale recurrent depth. It is useful when the task benefits from extra internal computation, especially knowledge manipulation and reasoning. It should not be expected to improve raw knowledge capacity, because looping does not add new stored parameters.
+
+The Looped-MoE paper also makes my previous explanation stronger. Dense looping has an obvious weakness: the same dense FFN is reused at multiple effective depths, so the model may lose expressivity compared to a normal stack of unique layers. Sparse MoE FFNs are a clean fix because the same physical layer can route the same token to different experts on different loop passes. That means a Looped-MoE block is not simply repeating the same computation.
+
+I also initially focused on the downside of adaptive exits. But it make looped transformers better for early exit. \
+In a standard transformer, intermediate layers are not meant to produce final predictions. Layer 8 of a 16-layer model is just a halfway representation, so exiting there usually gives poor logits. In a looped transformer, every loop ends after passing through the same physical block that is also used before the final prediction. This makes loop boundaries much more natural places
+to stop. The model is repeatedly pushed toward output-ready representations at those boundaries. \
+The Looped-MoE paper shows this empirically: even without adding a special early-exit training objective, looped models lose less quality when stopping early. So early exit is not only a serving complication; it is also one of the main reasons looped architectures may be useful.
+
+The inference concerns remain, but they are more nuanced:
+- adaptive loop counts make batching and scheduling harder
+- naive KV-cache storage can grow with loop count (but can be mitigated through policies)
+- real speedups depend on the serving stack, not just theoretical FLOP savings
+- routing overhead matters for Looped-MoE
+
+But this is no longer enough to dismiss the architecture. A production implementation could bucket requests by loop budget, use fixed loop counts for some workloads, or exit only at coarse loop boundaries. The video also show that several KV-cache policies can work, not only the most expensive "store every loop exactly" policy, and especially the "exit loop KV-cache" that make the KV-cache size "standard".
+
+My updated view:
+
+- Dense looped transformers are interesting but probably not the final form.
+- Looped-MoE is much more compelling because sparsity recovers expressivity lost by weight tying.
+- Looping is best understood as parameter-efficient extra compute, not free quality.
+- Early exit is one of the strongest practical reasons to care about looping.
+- This could plausibly matter for small/on-device models where stored weights are the bottleneck.
+- For frontier serving at massive scale, the main blocker is still systems engineering: batching, routing, KV-cache policy, and hardware utilization.
+
+I still would not confidently claim this is what is behind Claude/Mythos. But after Ouro and the Looped-MoE results, I think the architecture is more credible than my first impression. So the business question is not just whether looped models work technically, but whether the extra serving complexity is worth the gains: can a company serve them at scale with better
+quality per dollar, lower memory cost, or better latency trade-offs than a conventional dense or MoE transformer? As we can see Mythos pricing is very high (like $\times 5$ normal pricing). If it is a looped model behind, this could mean that it is currently very costly to run these models and not very efficient.
 
 ## Repo Focus
 
